@@ -15,6 +15,15 @@ VAULT_DAILY_NOTES_FOLDER = os.environ.get("VAULT_DAILY_NOTES_FOLDER", "")
 VAULT_DAILY_NOTES_FORMAT = os.environ.get("VAULT_DAILY_NOTES_FORMAT", "%Y-%m-%d").strip() or "%Y-%m-%d"
 VAULT_DAILY_NOTES_TEMPLATE = os.environ.get("VAULT_DAILY_NOTES_TEMPLATE", "")
 
+# Vault-relative folders whose search hits rank after everything else (an
+# archive, say). Comma-separated, e.g. "3 Archive". Nothing is hidden: these
+# folders stay readable and listable, and vault_search fills whatever budget
+# the rest of the vault leaves with their hits, marked "low_priority": true.
+# A search scoped inside one of them (path_prefix) runs as a normal search.
+VAULT_LOW_PRIORITY_DIRS = [
+    d.strip().strip("/") for d in os.environ.get("VAULT_LOW_PRIORITY_DIRS", "").split(",") if d.strip().strip("/")
+]
+
 # HTTP path the MCP transport is mounted at. Defaults to "/" so connectors that
 # POST to the root complete the handshake (#19) -- changing this default would
 # break that, so leave it unless you deliberately host under a path prefix.

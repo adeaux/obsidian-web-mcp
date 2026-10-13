@@ -361,7 +361,7 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
 
 @mcp.tool(
     name="vault_search",
-    description="Search for text across vault files, matching note names/paths as well as contents. Filename matches are returned first (match_type 'filename'), then content matches (match_type 'content') with context lines and frontmatter excerpts.",
+    description="Search for text across vault files, matching note names/paths as well as contents. Filename matches are returned first (match_type 'filename'), then content matches (match_type 'content') with context lines and frontmatter excerpts. If the server marks folders as low priority (an archive, say), their hits come after all others and carry low_priority: true; treat them as background and prefer the rest. Search inside such a folder directly with path_prefix.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def vault_search(

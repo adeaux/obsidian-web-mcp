@@ -16,14 +16,23 @@ from ..vault import resolve_vault_path, resolve_vault_read_path
 logger = logging.getLogger(__name__)
 
 
+def _under(rel_path: str, rel_dirs) -> bool:
+    """True when the vault-relative rel_path is one of rel_dirs or sits inside one."""
+    return any(rel_path == d or rel_path.startswith(d + "/") for d in rel_dirs)
+
+
 def _search_ripgrep(
     query: str,
     search_path: Path,
     file_pattern: list[str] | str,
     max_results: int,
     context_lines: int,
+    skip_dirs: tuple[str, ...] = (),
 ) -> list[dict]:
-    """Search using ripgrep for performance. file_pattern: one glob or several (any match)."""
+    """Search using ripgrep for performance. file_pattern: one glob or several (any match).
+
+    skip_dirs: vault-relative folders whose hits are dropped (low-priority folders
+    are searched in a later pass, see vault_search)."""
     file_patterns = [file_pattern] if isinstance(file_pattern, str) else list(file_pattern)
     cmd = [
         "rg",
@@ -82,7 +91,9 @@ def _search_ripgrep(
 
     for file_path, line_number in hits:
         try:
-            rel_path = str(Path(file_path).relative_to(config.VAULT_PATH))
+            rel_path = Path(file_path).relative_to(config.VAULT_PATH).as_posix()
+            if _under(rel_path, skip_dirs):
+                continue
             # rg has already read the bytes. A refusal must discard its match,
             # not fall back to the line in the JSON event.
             resolve_vault_read_path(rel_path)
@@ -106,7 +117,7 @@ def _search_ripgrep(
     return matches
 
 
-def _iter_vault_files(search_path: Path, file_pattern: list[str] | str):
+def _iter_vault_files(search_path: Path, file_pattern: list[str] | str, skip_dirs: tuple[str, ...] = ()):
     """Yield files under search_path, honoring EXCLUDED_DIRS and the glob pattern(s).
 
     file_pattern is one glob or several; a file matching any of them is yielded.
@@ -132,6 +143,8 @@ def _iter_vault_files(search_path: Path, file_pattern: list[str] | str):
             if entry.is_symlink():
                 continue
             if entry.is_dir(follow_symlinks=False):
+                if skip_dirs and _under(Path(entry.path).relative_to(config.VAULT_PATH).as_posix(), skip_dirs):
+                    continue
                 yield from walk(entry.path)
             elif entry.is_file(follow_symlinks=False) and any(
                 fnmatch.fnmatch(entry.name, pattern) for pattern in file_patterns
@@ -147,12 +160,13 @@ def _search_python(
     file_pattern: list[str] | str,
     max_results: int,
     context_lines: int,
+    skip_dirs: tuple[str, ...] = (),
 ) -> list[dict]:
     """Fallback Python-based search. file_pattern: one glob or several (any match)."""
     query_lower = query.lower()
     matches = []
 
-    for file_path in _iter_vault_files(search_path, file_pattern):
+    for file_path in _iter_vault_files(search_path, file_pattern, skip_dirs):
         try:
             rel_path = str(file_path.relative_to(config.VAULT_PATH))
             safe_path = resolve_vault_read_path(rel_path)
@@ -184,12 +198,13 @@ def _search_filenames(
     search_path: Path,
     file_pattern: str,
     max_results: int,
+    skip_dirs: tuple[str, ...] = (),
 ) -> list[dict]:
     """Match the query against vault-relative file paths (case-insensitive)."""
     query_lower = query.lower()
     matches = []
 
-    for file_path in _iter_vault_files(search_path, file_pattern):
+    for file_path in _iter_vault_files(search_path, file_pattern, skip_dirs):
         try:
             rel_path = str(file_path.relative_to(config.VAULT_PATH))
         except ValueError:
@@ -224,6 +239,49 @@ def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
         return None
 
 
+def _low_priority_dirs_within(search_path: Path) -> list[str]:
+    """Configured low-priority folders that lie inside search_path.
+
+    Empty when search_path is itself inside one: a search scoped to the archive
+    is a deliberate archive search and runs as a normal one."""
+    rel = search_path.relative_to(config.VAULT_PATH).as_posix() if search_path != config.VAULT_PATH else ""
+    if rel and _under(rel, config.VAULT_LOW_PRIORITY_DIRS):
+        return []
+    return [d for d in config.VAULT_LOW_PRIORITY_DIRS
+            if (not rel or _under(d, [rel])) and (config.VAULT_PATH / d).is_dir()]
+
+
+def _search_pass(query, search_path, content_patterns, name_pattern, max_results, context_lines, skip_dirs):
+    """One budgeted search over search_path, minus skip_dirs: name hits, then content hits."""
+    name_candidates = _search_filenames(query, search_path, name_pattern, max_results, skip_dirs)
+
+    # Content matches keep a guaranteed share of the budget: a query that
+    # is also a folder or date token can match many names, and those must
+    # not starve the body hits clients relied on before name matching.
+    content_budget = max_results - min(len(name_candidates), max_results // 2)
+    if shutil.which("rg"):
+        content_matches = _search_ripgrep(query, search_path, content_patterns, content_budget, context_lines, skip_dirs)
+    else:
+        content_matches = _search_python(query, search_path, content_patterns, content_budget, context_lines, skip_dirs)
+
+    # Only content hits get the frontmatter excerpt. Name-only hits are
+    # never read at all: the path locates the note, and reading it would
+    # be both an unbounded cost and a disclosure the walk already refuses.
+    for match in content_matches:
+        match["match_type"] = "content"
+        file_full_path = config.VAULT_PATH / match["path"]
+        match["frontmatter_excerpt"] = _get_frontmatter_excerpt(file_full_path)
+
+    # A file that also matched on content appears once, as the content
+    # match (it carries the line and context). Budget content did not use
+    # is backfilled with further name hits.
+    content_paths = {match["path"] for match in content_matches}
+    name_matches = [m for m in name_candidates if m["path"] not in content_paths]
+    name_matches = name_matches[: max_results - len(content_matches)]
+
+    return name_matches + content_matches
+
+
 def vault_search(
     query: str,
     path_prefix: str | None = None,
@@ -252,33 +310,21 @@ def vault_search(
         if not search_path.is_dir():
             return dumps({"error": f"Search path is not a directory: {path_prefix}"})
 
-        name_candidates = _search_filenames(query, search_path, name_pattern, max_results)
+        low_dirs = _low_priority_dirs_within(search_path)
 
-        # Content matches keep a guaranteed share of the budget: a query that
-        # is also a folder or date token can match many names, and those must
-        # not starve the body hits clients relied on before name matching.
-        content_budget = max_results - min(len(name_candidates), max_results // 2)
-        if shutil.which("rg"):
-            content_matches = _search_ripgrep(query, search_path, content_patterns, content_budget, context_lines)
-        else:
-            content_matches = _search_python(query, search_path, content_patterns, content_budget, context_lines)
-
-        # Only content hits get the frontmatter excerpt. Name-only hits are
-        # never read at all: the path locates the note, and reading it would
-        # be both an unbounded cost and a disclosure the walk already refuses.
-        for match in content_matches:
-            match["match_type"] = "content"
-            file_full_path = config.VAULT_PATH / match["path"]
-            match["frontmatter_excerpt"] = _get_frontmatter_excerpt(file_full_path)
-
-        # A file that also matched on content appears once, as the content
-        # match (it carries the line and context). Budget content did not use
-        # is backfilled with further name hits.
-        content_paths = {match["path"] for match in content_matches}
-        name_matches = [m for m in name_candidates if m["path"] not in content_paths]
-        name_matches = name_matches[: max_results - len(content_matches)]
-
-        matches = name_matches + content_matches
+        # Pass 1: everything except the low-priority folders gets the whole budget.
+        matches = _search_pass(query, search_path, content_patterns, name_pattern,
+                               max_results, context_lines, tuple(low_dirs))
+        # Pass 2: low-priority folders only fill what pass 1 left, and say so.
+        for low_dir in low_dirs:
+            remaining = max_results - len(matches)
+            if remaining <= 0:
+                break
+            extra = _search_pass(query, config.VAULT_PATH / low_dir, content_patterns, name_pattern,
+                                 remaining, context_lines, ())
+            for match in extra:
+                match["low_priority"] = True
+            matches += extra
 
         truncated = len(matches) >= max_results
 
@@ -312,16 +358,22 @@ def vault_search_frontmatter(
             path_prefix=path_prefix,
         )
 
+        # Low-priority folders rank last (stable sort keeps the index order otherwise).
+        results = sorted(results, key=lambda item: _under(item["path"], config.VAULT_LOW_PRIORITY_DIRS))
+
         formatted = []
         for item in results[:max_results]:
             path = item["path"]
             fm = item["frontmatter"]
             title = fm.get("title", Path(path).stem)
-            formatted.append({
+            entry = {
                 "path": path,
                 "frontmatter": fm,
                 "title": title,
-            })
+            }
+            if _under(path, config.VAULT_LOW_PRIORITY_DIRS):
+                entry["low_priority"] = True
+            formatted.append(entry)
 
         truncated = len(results) > max_results
 
