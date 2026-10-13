@@ -1,6 +1,7 @@
 """Search tools for the Obsidian vault MCP server."""
 
 import json
+import re
 import logging
 import shutil
 import subprocess
@@ -340,14 +341,33 @@ def vault_search(
         return dumps({"error": str(e)})
 
 
+def _natural_key(value) -> tuple:
+    """Sort key that compares digit runs as numbers: "ID-9" < "ID-10", "v2.10" > "v2.9".
+
+    Numbers and text never compare directly: each chunk is tagged (0 for a number, 1 for
+    text), so mixed values still sort deterministically instead of raising."""
+    if isinstance(value, bool):
+        value = str(value)
+    if isinstance(value, (int, float)):
+        return ((0, value, ""),)
+    parts = re.split(r"(\d+)", str(value).casefold())
+    return tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in parts if p != "")
+
+
 def vault_search_frontmatter(
     field: str,
     value: str = "",
     match_type: str = "exact",
     path_prefix: str | None = None,
     max_results: int = 20,
+    sort_by: str | None = None,
+    sort_order: str = "asc",
 ) -> str:
-    """Search vault files by frontmatter field values using the in-memory index."""
+    """Search vault files by frontmatter field values using the in-memory index.
+
+    sort_by sorts the matches by that field before max_results is applied, in natural
+    order (digit runs compare as numbers, so "BEANS-99" < "BEANS-136"). Notes lacking
+    the field go last in either direction. Unset keeps the index order."""
     from ..server import frontmatter_index
 
     try:
@@ -360,6 +380,12 @@ def vault_search_frontmatter(
 
         # Low-priority folders rank last (stable sort keeps the index order otherwise).
         results = sorted(results, key=lambda item: _under(item["path"], config.VAULT_LOW_PRIORITY_DIRS))
+
+        if sort_by:
+            present = [r for r in results if r["frontmatter"].get(sort_by) not in (None, "")]
+            missing = [r for r in results if r["frontmatter"].get(sort_by) in (None, "")]
+            present.sort(key=lambda r: _natural_key(r["frontmatter"][sort_by]), reverse=(sort_order == "desc"))
+            results = present + missing
 
         formatted = []
         for item in results[:max_results]:

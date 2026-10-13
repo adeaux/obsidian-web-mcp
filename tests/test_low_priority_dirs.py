@@ -112,3 +112,63 @@ def test_env_parsing(monkeypatch):
     finally:
         monkeypatch.delenv("VAULT_LOW_PRIORITY_DIRS")
         importlib.reload(config)
+
+
+# --- vault_search_frontmatter sort_by / sort_order -------------------------------------
+
+def _ids(results):
+    return [r["frontmatter"].get("ID") for r in results]
+
+
+@pytest.fixture
+def id_vault(vault_dir):
+    from obsidian_vault_mcp.server import frontmatter_index
+
+    log = vault_dir / "Issues"
+    log.mkdir()
+    for n in (9, 10, 136, 99, 2):
+        (log / f"issue-{n}.md").write_text(f"---\nID: BEANS-{n}\n---\nx\n")
+    (log / "no-id.md").write_text("---\nStatus: Open\n---\nx\n")
+    frontmatter_index.rebuild()
+    return vault_dir
+
+
+def _fm(**kwargs):
+    from obsidian_vault_mcp.tools.search import vault_search_frontmatter
+    return json.loads(vault_search_frontmatter(**kwargs))["results"]
+
+
+def test_highest_id_in_one_call_uses_natural_order(id_vault):
+    top = _fm(field="ID", match_type="exists", path_prefix="Issues", sort_by="ID", sort_order="desc", max_results=1)
+    assert _ids(top) == ["BEANS-136"]
+
+
+def test_ascending_natural_order(id_vault):
+    res = _fm(field="ID", match_type="exists", path_prefix="Issues", sort_by="ID", max_results=50)
+    assert _ids(res) == ["BEANS-2", "BEANS-9", "BEANS-10", "BEANS-99", "BEANS-136"]
+
+
+def test_notes_missing_the_sort_field_go_last_both_ways(id_vault):
+    for order in ("asc", "desc"):
+        res = _fm(field="Status", match_type="exists", path_prefix="Issues", sort_by="ID", sort_order=order, max_results=50)
+        assert res[-1]["path"].endswith("no-id.md")
+
+
+def test_sorting_happens_before_truncation(id_vault):
+    # Without sorting, max_results=1 returns whatever the index holds first; with it, always the max.
+    for _ in range(3):
+        assert _ids(_fm(field="ID", match_type="exists", sort_by="ID", sort_order="desc", max_results=1)) == ["BEANS-136"]
+
+
+def test_mixed_types_do_not_raise():
+    from obsidian_vault_mcp.tools.search import _natural_key
+    values = ["v2.10", "v2.9", 7, 3.5, True, "abc"]
+    sorted(values, key=_natural_key)
+    assert sorted(["v2.10", "v2.9"], key=_natural_key) == ["v2.9", "v2.10"]
+
+
+def test_sort_order_is_validated():
+    from pydantic import ValidationError
+    from obsidian_vault_mcp.models import VaultSearchFrontmatterInput
+    with pytest.raises(ValidationError):
+        VaultSearchFrontmatterInput(field="ID", sort_by="ID", sort_order="sideways")

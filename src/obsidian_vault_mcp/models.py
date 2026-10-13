@@ -382,6 +382,17 @@ class VaultSearchFrontmatterInput(BaseModel):
         description="Maximum number of matching files to return",
     )
 
+    sort_by: str | None = Field(
+        default=None,
+        description="Frontmatter field to sort results by before max_results is applied, in natural order (so ID-9 sorts before ID-10). Notes without the field sort last.",
+        min_length=1,
+        max_length=100,
+    )
+    sort_order: Literal["asc", "desc"] = Field(
+        default="asc",
+        description="Sort direction when sort_by is set. 'desc' with max_results=1 returns the highest value, e.g. the latest ID.",
+    )
+
 
 class VaultBatchReadInput(BaseModel):
     """Read multiple vault files in a single request."""

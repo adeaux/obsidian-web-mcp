@@ -381,7 +381,7 @@ def vault_search(
 
 @mcp.tool(
     name="vault_search_frontmatter",
-    description="Search vault files by YAML frontmatter field values. Queries an in-memory index for fast results. Supports exact match, contains, and field-exists queries.",
+    description="Search vault files by YAML frontmatter field values. Queries an in-memory index for fast results. Supports exact match, contains, and field-exists queries. Optional sort_by/sort_order sort by any field in natural order before max_results applies, so the highest value of a field (such as the latest sequential ID) is one call: match_type exists, sort_by that field, sort_order desc, max_results 1.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def vault_search_frontmatter(
@@ -390,12 +390,16 @@ def vault_search_frontmatter(
     match_type: str = "exact",
     path_prefix: str | None = None,
     max_results: int = 20,
+    sort_by: str | None = None,
+    sort_order: str = "asc",
 ) -> str:
     """Search by frontmatter fields."""
-    inp = VaultSearchFrontmatterInput(field=field, value=value, match_type=match_type, path_prefix=path_prefix, max_results=max_results)
+    inp = VaultSearchFrontmatterInput(field=field, value=value, match_type=match_type, path_prefix=path_prefix,
+                                      max_results=max_results, sort_by=sort_by, sort_order=sort_order)
     return run_audited(
         "vault_search_frontmatter",
-        lambda: _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results),
+        lambda: _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results,
+                                          inp.sort_by, inp.sort_order),
     )
 
 
