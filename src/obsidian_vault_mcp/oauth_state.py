@@ -22,11 +22,15 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ACCESS_TOKEN_TTL_SECONDS = 24 * 60 * 60
 REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 
-_SCHEMA = """
+# The subject under which failures from every address are counted together.
+GLOBAL_SUBJECT = "*"
+
+# Version 1: clients and tokens.
+_SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS clients (
     client_id TEXT PRIMARY KEY,
     secret_verifier BLOB,
@@ -60,6 +64,27 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     consumed_at REAL
 );
 """
+
+# Each entry upgrades the schema from its key to the next version. A fresh store runs
+# _SCHEMA_V1 and then every migration, so new and upgraded stores take the same path.
+_MIGRATIONS = {
+    # 1 -> 2: failed sign-ins and the lockouts they trip, kept on disk so a restart
+    # neither forgets a lock nor resets the count toward the next one.
+    1: """
+CREATE TABLE IF NOT EXISTS login_failures (
+    subject TEXT NOT NULL,
+    failed_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS login_failures_by_subject ON login_failures (subject, failed_at);
+CREATE TABLE IF NOT EXISTS login_lockouts (
+    subject TEXT PRIMARY KEY,
+    trips INTEGER NOT NULL,
+    locked_until REAL,
+    permanent INTEGER NOT NULL CHECK (permanent IN (0, 1)),
+    updated_at REAL NOT NULL
+);
+""",
+}
 
 
 # --- Errors ------------------------------------------------------------------------------
@@ -119,6 +144,35 @@ class IssuedToken:
     access_token: str
     token: TokenMetadata
     refresh_token: str | None = None
+
+
+@dataclass(frozen=True)
+class LockoutPolicy:
+    """When failed sign-ins lock an address, and for how long.
+
+    schedule holds one lock duration in seconds per trip; None locks permanently. Past
+    the end of the schedule its last step repeats. The global limit counts failures from
+    every address together and locks every address for global_lock_seconds, never for good.
+    """
+    failures: int
+    window_seconds: float
+    schedule: tuple[float | None, ...]
+    global_failures: int
+    global_window_seconds: float
+    global_lock_seconds: float
+
+
+@dataclass(frozen=True)
+class Lockout:
+    """A lock on one subject: an address, or GLOBAL_SUBJECT for every address."""
+    subject: str
+    trips: int
+    locked_until: float | None
+    permanent: bool
+
+    def active(self, now: float) -> bool:
+        """True while the lock still refuses sign-ins."""
+        return self.permanent or (self.locked_until is not None and self.locked_until > now)
 
 
 # --- The store ---------------------------------------------------------------------------
@@ -459,6 +513,124 @@ class OAuthState:
             refresh_token=refresh_token,
         )
 
+    # --- Login lockouts ------------------------------------------------------------------
+
+    def active_lockout(self, subject: str) -> Lockout | None:
+        """The lock refusing subject now, its own or the global one; permanent wins."""
+        now = self._clock()
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM login_lockouts WHERE subject IN (?, ?)",
+                (subject, GLOBAL_SUBJECT),
+            ).fetchall()
+        active = [lock for lock in map(_lockout_from_row, rows) if lock.active(now)]
+        if not active:
+            return None
+        return max(active, key=lambda lock: (lock.permanent, lock.locked_until or 0.0))
+
+    def record_login_failure(self, subject: str, policy: LockoutPolicy) -> list[Lockout]:
+        """Count one failed sign-in from subject; return the locks it tripped, if any."""
+        now = self._clock()
+        tripped: list[Lockout] = []
+        with self._transaction() as connection:
+            connection.executemany(
+                "INSERT INTO login_failures (subject, failed_at) VALUES (?, ?)",
+                ((subject, now), (GLOBAL_SUBJECT, now)),
+            )
+            # Forget failures that have left their window, for every address at once.
+            connection.execute(
+                "DELETE FROM login_failures WHERE subject != ? AND failed_at <= ?",
+                (GLOBAL_SUBJECT, now - policy.window_seconds),
+            )
+            connection.execute(
+                "DELETE FROM login_failures WHERE subject = ? AND failed_at <= ?",
+                (GLOBAL_SUBJECT, now - policy.global_window_seconds),
+            )
+            # This address
+            if self._failures(connection, subject) >= policy.failures:
+                trips = self._trips(connection, subject) + 1
+                step = policy.schedule[min(trips, len(policy.schedule)) - 1]
+                tripped.append(self._lock_subject(
+                    connection, subject, trips=trips, duration=step, now=now
+                ))
+            # Every address together
+            if self._failures(connection, GLOBAL_SUBJECT) >= policy.global_failures:
+                trips = self._trips(connection, GLOBAL_SUBJECT) + 1
+                tripped.append(self._lock_subject(
+                    connection, GLOBAL_SUBJECT, trips=trips,
+                    duration=policy.global_lock_seconds, now=now,
+                ))
+        return tripped
+
+    def record_login_success(self, subject: str) -> None:
+        """A correct sign-in from subject clears its failures and its trip count."""
+        with self._transaction() as connection:
+            connection.execute("DELETE FROM login_failures WHERE subject = ?", (subject,))
+            connection.execute("DELETE FROM login_lockouts WHERE subject = ?", (subject,))
+
+    def list_lockouts(self) -> list[Lockout]:
+        """Every subject with a recorded trip, locked now or not."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM login_lockouts ORDER BY subject"
+            ).fetchall()
+        return [_lockout_from_row(row) for row in rows]
+
+    def unlock(self, subject: str | None) -> int:
+        """Lift the lock on subject and forget its trips, or on everything for None.
+
+        Returns how many lock records were removed.
+        """
+        with self._transaction() as connection:
+            if subject is None:
+                connection.execute("DELETE FROM login_failures")
+                return connection.execute("DELETE FROM login_lockouts").rowcount
+            connection.execute("DELETE FROM login_failures WHERE subject = ?", (subject,))
+            return connection.execute(
+                "DELETE FROM login_lockouts WHERE subject = ?", (subject,)
+            ).rowcount
+
+    @staticmethod
+    def _failures(connection: sqlite3.Connection, subject: str) -> int:
+        """Failures of subject still inside their window."""
+        return int(connection.execute(
+            "SELECT COUNT(*) FROM login_failures WHERE subject = ?", (subject,)
+        ).fetchone()[0])
+
+    @staticmethod
+    def _trips(connection: sqlite3.Connection, subject: str) -> int:
+        """How many times subject has been locked before."""
+        row = connection.execute(
+            "SELECT trips FROM login_lockouts WHERE subject = ?", (subject,)
+        ).fetchone()
+        return int(row["trips"]) if row else 0
+
+    @staticmethod
+    def _lock_subject(
+        connection: sqlite3.Connection,
+        subject: str,
+        *,
+        trips: int,
+        duration: float | None,
+        now: float,
+    ) -> Lockout:
+        """Store a lock on subject and start its failure count over."""
+        lock = Lockout(
+            subject=subject,
+            trips=trips,
+            locked_until=None if duration is None else now + duration,
+            permanent=duration is None,
+        )
+        connection.execute(
+            "INSERT INTO login_lockouts (subject, trips, locked_until, permanent, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(subject) DO UPDATE SET "
+            "trips = excluded.trips, locked_until = excluded.locked_until, "
+            "permanent = excluded.permanent, updated_at = excluded.updated_at",
+            (subject, trips, lock.locked_until, int(lock.permanent), now),
+        )
+        connection.execute("DELETE FROM login_failures WHERE subject = ?", (subject,))
+        return lock
+
     # --- Files, connection and schema ----------------------------------------------------
 
     def _tighten_files(self) -> None:
@@ -475,15 +647,17 @@ class OAuthState:
         self._connection.execute("PRAGMA synchronous = FULL")
 
     def _initialize_schema(self) -> None:
-        """Create the tables once."""
+        """Create the tables, or upgrade older ones, in one transaction."""
         with self._lock:
             version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in (0, SCHEMA_VERSION):
+            if not 0 <= version <= SCHEMA_VERSION:
                 raise OAuthStateError(f"unsupported OAuth state schema version {version}")
+            steps = [_SCHEMA_V1] if version == 0 else []
+            steps += [_MIGRATIONS[step] for step in range(max(version, 1), SCHEMA_VERSION)]
             script = (
                 "BEGIN IMMEDIATE;\n"
-                f"{_SCHEMA}\n"
-                f"PRAGMA user_version = {SCHEMA_VERSION};\n"
+                + "\n".join(steps)
+                + f"\nPRAGMA user_version = {SCHEMA_VERSION};\n"
                 "COMMIT;\n"
             )
             try:
@@ -622,6 +796,16 @@ def _parse_token(prefix: str, token: str) -> tuple[str, str] | None:
     if len(parts) != 3 or parts[0] != prefix or not parts[1] or not parts[2]:
         return None
     return parts[1], parts[2]
+
+
+def _lockout_from_row(row: sqlite3.Row) -> Lockout:
+    """A lockout from a row."""
+    return Lockout(
+        subject=str(row["subject"]),
+        trips=int(row["trips"]),
+        locked_until=float(row["locked_until"]) if row["locked_until"] is not None else None,
+        permanent=bool(row["permanent"]),
+    )
 
 
 def _client_from_row(row: sqlite3.Row, redirect_uris: tuple[str, ...]) -> ClientMetadata:

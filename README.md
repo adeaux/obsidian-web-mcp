@@ -41,6 +41,8 @@ This is a server that provides network access to your personal notes. Security i
 
 **Failed logins and client registrations are rate-limited, globally.** After 10 failed password attempts within 15 minutes, `/oauth/authorize` refuses every login, the correct password included, until the window passes; `/oauth/register` accepts at most 20 registrations an hour. The trade-off: someone hammering the login can hold it closed for the owner for that long, but tokens already issued keep working, so connected clients are unaffected.
 
+**Escalating lockout (opt-in).** Set `OAUTH_LOCKOUT_SCHEDULE` and the global brake on failed logins is replaced by locks per caller address. An address that fails `OAUTH_LOCKOUT_FAILURES` times (default 5) within `OAUTH_LOCKOUT_WINDOW_SECONDS` (default an hour) is locked for the next step of the schedule, e.g. `3600,86400,permanent`: an hour, then a day, then until you lift it with `vault-mcp-oauth lockout unlock`. A correct sign-in from the address starts its schedule over, and IPv6 addresses are grouped by their /64 so one connection cannot dodge its lock by changing the end of its address. A higher global limit (`OAUTH_LOCKOUT_GLOBAL_FAILURES`, default 30 an hour) still locks every address for `OAUTH_LOCKOUT_GLOBAL_SECONDS`, never permanently, against a guesser spread over many addresses. Locks are kept in the OAuth store and survive restarts. The caller address comes from `OAUTH_CLIENT_IP_HEADER` (default `CF-Connecting-IP`, which Cloudflare Tunnel sets and overwrites), so the mode refuses to start unless `VAULT_MCP_HOST` is loopback, and refuses any sign-in that arrives without a usable address. Anyone who reaches the login can still lock out *their own* address for good, never yours.
+
 **Your vault is never exposed directly to the internet.** The recommended deployment uses a Cloudflare Tunnel -- an outbound-only encrypted connection. Your machine opens no inbound ports, and the server itself binds to loopback (`127.0.0.1`) by default. The login above is the authentication boundary; you can additionally layer Cloudflare Access (SSO, device posture, IP restrictions) on top for defense in depth.
 
 ### Cloudflare Access mode (opt-in)
@@ -241,6 +243,13 @@ All configuration is via environment variables:
 | `VAULT_OAUTH_CLIENT_ID` | No | `vault-mcp-client` | Client ID for the headless `client_credentials` grant |
 | `VAULT_OAUTH_CLIENT_SECRET` | No | (none) | Only required for the headless `client_credentials` grant. The Claude/ChatGPT browser flow uses dynamic client registration and does **not** need this. |
 | `VAULT_OAUTH_REDIRECT_URIS` | No | (none) | Comma-separated allowlist of redirect URIs for the static `VAULT_OAUTH_CLIENT_ID` when using the browser flow. Dynamically-registered clients (Claude/ChatGPT) carry their own; leave unset unless you connect a static client through `/oauth/authorize`. |
+| `OAUTH_LOCKOUT_SCHEDULE` | No | (none) | Turns on the escalating per-address login lockout. Comma-separated lock durations in seconds, one per trip; `permanent` may be the last step. Past the end the last step repeats. |
+| `OAUTH_LOCKOUT_FAILURES` | No | `5` | Failed sign-ins from one address that trip its next lock. |
+| `OAUTH_LOCKOUT_WINDOW_SECONDS` | No | `3600` | Window those failures are counted in. |
+| `OAUTH_LOCKOUT_GLOBAL_FAILURES` | No | `30` | Failed sign-ins from all addresses together that lock every address. |
+| `OAUTH_LOCKOUT_GLOBAL_WINDOW_SECONDS` | No | `3600` | Window the global failures are counted in. |
+| `OAUTH_LOCKOUT_GLOBAL_SECONDS` | No | `3600` | How long the global lock holds. Never permanent. |
+| `OAUTH_CLIENT_IP_HEADER` | No | `CF-Connecting-IP` | Header carrying the caller's address when the lockout is on. Only trustworthy from a reverse proxy on loopback. |
 | `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` | No | (none) | Cloudflare team domain, e.g. `myteam.cloudflareaccess.com` (a bare `myteam` or a full URL is accepted). Set **together with** `VAULT_MCP_CF_ACCESS_AUD` to enable [Cloudflare Access mode](#cloudflare-access-mode-opt-in) (both-or-neither; if either is unset the mode is off). When on, the app's own OAuth routes are not served and `VAULT_MCP_TOKEN` / `VAULT_OAUTH_*` are unused — Cloudflare is the sole auth authority. **Validated at startup:** a malformed domain fails the server closed with a clear message. Requires the `cloudflare-access` extra (missing → fail closed at startup). |
 | `VAULT_MCP_CF_ACCESS_AUD` | No | (none) | Cloudflare Access application **audience (AUD)** tag (from the application's *AUD tag* tab). The second half of Cloudflare Access mode; see `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` above. |
 | `VAULT_DAILY_NOTES_FOLDER` | No | (none) | Folder for the daily-note tools; empty means the vault root |
@@ -270,13 +279,15 @@ Clients and tokens live in `oauth_state.sqlite3`, next to `oauth_clients.json` (
 ```bash
 vault-mcp-oauth clients list
 vault-mcp-oauth clients revoke <client-id>
+vault-mcp-oauth lockout list
+vault-mcp-oauth lockout unlock <address>   # or --global, or --all
 ```
 
-Both print JSON and no secrets. A revoked client is refused by the running server on its next request, no restart needed. The client configured with `VAULT_OAUTH_CLIENT_ID` is listed once it has a token; its secret and redirect URIs stay in the environment, so the listing shows none.
+All print JSON and no secrets. `lockout unlock` takes an address as the login saw it or an IPv6 /64 as `lockout list` prints it, and also forgets that address's trips; a permanent lock lifts only this way. A revoked client is refused by the running server on its next request, no restart needed. The client configured with `VAULT_OAUTH_CLIENT_ID` is listed once it has a token; its secret and redirect URIs stay in the environment, so the listing shows none.
 
 **Upgrading.** Whenever the store opens, it adds the clients from `oauth_clients.json` that it does not have yet. The file is only read, never changed or removed. From then on the database is the source of truth: editing a client in the JSON file has no effect, and a revoked client stays revoked. A client that connected before the upgrade holds `VAULT_MCP_TOKEN` itself, so revoking it takes effect only after that token is rotated.
 
-**Going back.** An earlier version reads `oauth_clients.json`, which this version never writes. Clients registered since the upgrade have to register again, and per-client tokens stop working.
+**Going back.** An earlier version reads `oauth_clients.json`, which this version never writes. Clients registered since the upgrade have to register again, and per-client tokens stop working. The store's schema version 2 adds the lockout tables; a version 1 store is upgraded in place on first open, and a server from before that upgrade refuses a version 2 store, so going back past it means restoring the database from a backup.
 
 ## Signed uploads
 
@@ -436,8 +447,8 @@ src/obsidian_vault_mcp/
     frontmatter_index.py    # In-memory YAML frontmatter index with filesystem watcher
     models.py               # Pydantic input validation models
     oauth.py                # OAuth 2.0 authorization code flow with PKCE
-    oauth_admin.py          # vault-mcp-oauth: list and revoke OAuth clients
-    oauth_state.py          # SQLite store of OAuth clients and their tokens
+    oauth_admin.py          # vault-mcp-oauth: OAuth clients and login lockouts
+    oauth_state.py          # SQLite store of OAuth clients, tokens and login lockouts
     serialization.py        # JSON encoder for tool responses (dates, etc.)
     server.py               # FastMCP server setup, tool registration, entry point
     vault.py                # Core filesystem operations (path security, atomic writes)

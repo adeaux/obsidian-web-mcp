@@ -35,6 +35,7 @@ import base64
 import hashlib
 import hmac
 import html
+import ipaddress
 import logging
 import math
 import secrets
@@ -49,7 +50,15 @@ from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse
 from starlette.routing import Route
 
 from . import config
-from .oauth_state import InvalidClient, InvalidGrant, InvalidTarget, IssuedToken, OAuthState, _storable
+from .oauth_state import (
+    InvalidClient,
+    InvalidGrant,
+    InvalidTarget,
+    IssuedToken,
+    Lockout,
+    OAuthState,
+    _storable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +88,11 @@ def get_oauth_state() -> OAuthState:
     global _state
     with _state_lock:
         if _state is None:
-            _state = OAuthState(_state_path(), legacy_path=config.OAUTH_CLIENTS_PATH)
+            _state = OAuthState(
+                _state_path(),
+                legacy_path=config.OAUTH_CLIENTS_PATH,
+                clock=lambda: _wall_clock(),
+            )
         return _state
 
 
@@ -140,6 +153,50 @@ class _SlidingLimit:
 
 _login_failures = _SlidingLimit(LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW_SECONDS)
 _registrations = _SlidingLimit(REGISTRATION_LIMIT, REGISTRATION_WINDOW_SECONDS)
+
+
+# The store's clock. Lockouts are kept as wall-clock times so they survive a restart;
+# tests move time through this, which moves the store and the refusal page together.
+_wall_clock = time.time
+
+
+def lockout_subject(address: str) -> str | None:
+    """The lockout subject for an address: IPv4 as is, IPv6 grouped by its /64.
+
+    Accepts a bare address or a network (as `vault-mcp-oauth lockout list` prints them);
+    returns None for anything else, so a malformed header can never name a subject.
+    """
+    text = (address or "").strip()
+    try:
+        if "/" in text:
+            network = ipaddress.ip_network(text, strict=False)
+            if network.version == 4:
+                return str(network.network_address) if network.prefixlen == 32 else None
+            if network.prefixlen > 64:
+                network = network.supernet(new_prefix=64)
+            return str(network) if network.prefixlen == 64 else None
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    if ip.version == 6:
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip)
+
+
+def _locked_out_form(params: dict, lock: Lockout) -> HTMLResponse:
+    """The refusal shown while a lock holds; a global lock reads like a temporary one."""
+    if lock.permanent:
+        return _login_form(params, error="Sign-in from this address is blocked.", status=403)
+    wait = max(1, math.ceil(lock.locked_until - _wall_clock()))
+    when = f"{max(1, wait // 60)} minute(s)" if wait < 2 * 60 * 60 else f"{wait // 3600} hour(s)"
+    return _login_form(
+        params,
+        error=f"Too many failed sign-in attempts. Try again in {when}.",
+        status=429,
+        headers={"Retry-After": str(wait)},
+    )
 
 
 def _cleanup_codes():
@@ -395,23 +452,51 @@ async def oauth_authorize(request: Request):
         # No credentials yet -- show the login form.
         return _login_form(oauth_params)
 
-    # POST: refuse every attempt while the failure brake is tripped, the correct password
+    # POST: refuse every attempt while a brake or lock holds, the correct password
     # included; otherwise the brake would only slow a guesser down, not stop a lucky guess.
-    wait = _login_failures.retry_after()
-    if wait:
-        logger.warning("OAuth login refused: too many failed attempts, %ss until the next try.", wait)
-        return _login_form(
-            oauth_params,
-            error=f"Too many failed sign-in attempts. Try again in {max(1, wait // 60)} minute(s).",
-            status=429,
-            headers={"Retry-After": str(wait)},
-        )
+    policy = config.lockout_policy()
+    if policy is None:
+        wait = _login_failures.retry_after()
+        if wait:
+            logger.warning("OAuth login refused: too many failed attempts, %ss until the next try.", wait)
+            return _login_form(
+                oauth_params,
+                error=f"Too many failed sign-in attempts. Try again in {max(1, wait // 60)} minute(s).",
+                status=429,
+                headers={"Retry-After": str(wait)},
+            )
+    else:
+        # Escalating lockout: the caller is known by the address the reverse proxy reports.
+        # Without a usable one there is no subject to hold to account, so refuse.
+        subject = lockout_subject(request.headers.get(config.OAUTH_CLIENT_IP_HEADER, ""))
+        if subject is None:
+            logger.error("OAuth login refused: no usable caller address in %s.", config.OAUTH_CLIENT_IP_HEADER)
+            return _login_form(oauth_params, error="Sign-in is unavailable.", status=400)
+        lock = get_oauth_state().active_lockout(subject)
+        if lock is not None:
+            logger.warning("OAuth login refused from %s: locked out (%s).", subject,
+                           "global" if lock.subject != subject else
+                           "permanent" if lock.permanent else f"trip {lock.trips}")
+            return _locked_out_form(oauth_params, lock)
 
     # Verify the submitted credentials.
     if not _check_credentials(form.get("username", ""), form.get("password", "")):
-        _login_failures.record()
-        logger.warning("OAuth login failed.")
+        if policy is None:
+            _login_failures.record()
+            logger.warning("OAuth login failed.")
+        else:
+            logger.warning("OAuth login failed from %s.", subject)
+            for tripped in get_oauth_state().record_login_failure(subject, policy):
+                logger.warning(
+                    "OAuth lockout tripped for %s: trip %d, %s.",
+                    "every address" if tripped.subject != subject else subject,
+                    tripped.trips,
+                    "permanent until `vault-mcp-oauth lockout unlock`" if tripped.permanent
+                    else f"until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(tripped.locked_until))}",
+                )
         return _login_form(oauth_params, error="Incorrect username or password.")
+    if policy is not None:
+        get_oauth_state().record_login_success(subject)
 
     # The code carries the resource of this authorization; the token request may reach
     # the server under another Host.
