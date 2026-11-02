@@ -250,6 +250,7 @@ All configuration is via environment variables:
 | `OAUTH_LOCKOUT_GLOBAL_WINDOW_SECONDS` | No | `3600` | Window the global failures are counted in. |
 | `OAUTH_LOCKOUT_GLOBAL_SECONDS` | No | `3600` | How long the global lock holds. Never permanent. |
 | `OAUTH_CLIENT_IP_HEADER` | No | `CF-Connecting-IP` | Header carrying the caller's address when the lockout is on. Only trustworthy from a reverse proxy on loopback. |
+| `VAULT_MCP_TOKEN_LOCAL_ONLY` | No | off | Accept `VAULT_MCP_TOKEN` only on requests made on this machine: from a loopback address, carrying none of the headers a proxy adds (`CF-Connecting-IP`, `CF-Ray`, `X-Forwarded-For`, `Forwarded`, `X-Real-IP`, or `OAUTH_CLIENT_IP_HEADER`). Relayed requests then need a per-client OAuth token; a relayed static token gets the same 401 as a wrong one and a warning is logged. Accepts 1/true/yes/on. |
 | `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` | No | (none) | Cloudflare team domain, e.g. `myteam.cloudflareaccess.com` (a bare `myteam` or a full URL is accepted). Set **together with** `VAULT_MCP_CF_ACCESS_AUD` to enable [Cloudflare Access mode](#cloudflare-access-mode-opt-in) (both-or-neither; if either is unset the mode is off). When on, the app's own OAuth routes are not served and `VAULT_MCP_TOKEN` / `VAULT_OAUTH_*` are unused — Cloudflare is the sole auth authority. **Validated at startup:** a malformed domain fails the server closed with a clear message. Requires the `cloudflare-access` extra (missing → fail closed at startup). |
 | `VAULT_MCP_CF_ACCESS_AUD` | No | (none) | Cloudflare Access application **audience (AUD)** tag (from the application's *AUD tag* tab). The second half of Cloudflare Access mode; see `VAULT_MCP_CF_ACCESS_TEAM_DOMAIN` above. |
 | `VAULT_DAILY_NOTES_FOLDER` | No | (none) | Folder for the daily-note tools; empty means the vault root |
@@ -272,7 +273,7 @@ Generate secrets with: `python -c "import secrets; print(secrets.token_hex(32))"
 
 ## OAuth clients and tokens
 
-Each client that completes the OAuth flow gets its own access token, valid for one day, and a refresh token, valid for thirty days and replaced on every use. A refresh token that was already used is refused; the tokens issued since stay valid. Every client has the same full tool access as `VAULT_MCP_TOKEN`, which keeps working as before.
+Each client that completes the OAuth flow gets its own access token, valid for one day, and a refresh token, valid for thirty days and replaced on every use. A refresh token that was already used is refused; the tokens issued since stay valid. Every client has the same full tool access as `VAULT_MCP_TOKEN`, which keeps working as before (only on this machine when `VAULT_MCP_TOKEN_LOCAL_ONLY` is on).
 
 Clients and tokens live in `oauth_state.sqlite3`, next to `oauth_clients.json` (`~/.local/share/vault-mcp/` by default). Secrets and tokens are stored as hashes only. Whenever the store opens, its directory is tightened to `0700` and the database file to `0600`. Keep that directory outside the vault and do not share it with other applications; the server does not check either.
 
