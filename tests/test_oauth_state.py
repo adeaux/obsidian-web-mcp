@@ -105,10 +105,10 @@ def test_redirect_repeated_in_one_registration_is_stored_once(state_path):
 def test_state_written_by_a_newer_version_is_refused(state_path):
     _open(state_path).close()
     connection = sqlite3.connect(state_path)
-    connection.execute("PRAGMA user_version = 2")
+    connection.execute("PRAGMA user_version = 3")
     connection.close()
 
-    with pytest.raises(OAuthStateError, match="schema version 2"):
+    with pytest.raises(OAuthStateError, match="schema version 3"):
         _open(state_path)
 
 

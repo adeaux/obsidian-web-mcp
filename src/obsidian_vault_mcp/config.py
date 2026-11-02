@@ -61,6 +61,27 @@ OAUTH_CLIENTS_PATH = Path(os.environ.get(
     Path.home() / ".local" / "share" / "vault-mcp" / "oauth_clients.json",
 ))
 
+# Escalating login lockout (optional, opt-in). Off unless OAUTH_LOCKOUT_SCHEDULE is set;
+# then it replaces the in-memory global brake on failed logins. An address that fails
+# OAUTH_LOCKOUT_FAILURES times within OAUTH_LOCKOUT_WINDOW_SECONDS is locked for the next
+# step of the schedule: comma-separated durations in seconds, where "permanent" (last
+# step only) locks the address until `vault-mcp-oauth lockout unlock`. Past the end the
+# last step repeats; a correct sign-in from the address starts it over. IPv6 addresses
+# are grouped by their /64. Separately, OAUTH_LOCKOUT_GLOBAL_FAILURES failures from all
+# addresses within OAUTH_LOCKOUT_GLOBAL_WINDOW_SECONDS lock every address for
+# OAUTH_LOCKOUT_GLOBAL_SECONDS (never permanently): the backstop against a guesser
+# spread over many addresses. Locks live in the OAuth store and survive restarts.
+# The caller's address comes from OAUTH_CLIENT_IP_HEADER, which only a reverse proxy
+# reaching the server over loopback can be trusted to set, so the mode requires a
+# loopback VAULT_MCP_HOST and refuses a sign-in that arrives without the header.
+OAUTH_LOCKOUT_SCHEDULE = os.environ.get("OAUTH_LOCKOUT_SCHEDULE", "").strip()
+OAUTH_LOCKOUT_FAILURES = os.environ.get("OAUTH_LOCKOUT_FAILURES", "5").strip()
+OAUTH_LOCKOUT_WINDOW_SECONDS = os.environ.get("OAUTH_LOCKOUT_WINDOW_SECONDS", "3600").strip()
+OAUTH_LOCKOUT_GLOBAL_FAILURES = os.environ.get("OAUTH_LOCKOUT_GLOBAL_FAILURES", "30").strip()
+OAUTH_LOCKOUT_GLOBAL_WINDOW_SECONDS = os.environ.get("OAUTH_LOCKOUT_GLOBAL_WINDOW_SECONDS", "3600").strip()
+OAUTH_LOCKOUT_GLOBAL_SECONDS = os.environ.get("OAUTH_LOCKOUT_GLOBAL_SECONDS", "3600").strip()
+OAUTH_CLIENT_IP_HEADER = os.environ.get("OAUTH_CLIENT_IP_HEADER", "CF-Connecting-IP").strip()
+
 # Network bind address. Defaults to loopback so the server is NOT exposed on the LAN;
 # Cloudflare Tunnel reaches it over localhost. Set to 0.0.0.0 only if you deliberately
 # want direct network exposure.
@@ -349,6 +370,59 @@ def validate_config() -> None:
     # A no-op unless Cloudflare Access mode is on (both settings set).
     from .cf_access import validate_cf_access_config
     validate_cf_access_config()
+    lockout_policy()
+
+
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def lockout_policy():
+    """The escalating login lockout policy, or None when the mode is off.
+
+    Parsed on every call from the raw settings, so a bad value raises ValueError here
+    (and validate_config() fails startup closed) instead of silently falling back.
+    """
+    from .oauth_state import LockoutPolicy  # oauth_state imports nothing from here
+
+    if not OAUTH_LOCKOUT_SCHEDULE:
+        return None
+    steps: list[float | None] = []
+    parts = [part.strip() for part in OAUTH_LOCKOUT_SCHEDULE.split(",")]
+    for index, part in enumerate(parts):
+        if part.lower() == "permanent":
+            if index != len(parts) - 1:
+                raise ValueError("OAUTH_LOCKOUT_SCHEDULE: 'permanent' can only be the last step")
+            steps.append(None)
+            continue
+        steps.append(float(_positive_int("OAUTH_LOCKOUT_SCHEDULE step", part)))
+    if not OAUTH_CLIENT_IP_HEADER:
+        raise ValueError("OAUTH_CLIENT_IP_HEADER must name the header carrying the caller's address")
+    if VAULT_MCP_HOST.strip().strip("[]").lower() not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            "OAUTH_LOCKOUT_SCHEDULE needs VAULT_MCP_HOST on loopback: the caller address "
+            f"header can only be trusted from a reverse proxy on this machine, got {VAULT_MCP_HOST!r}"
+        )
+    return LockoutPolicy(
+        failures=_positive_int("OAUTH_LOCKOUT_FAILURES", OAUTH_LOCKOUT_FAILURES),
+        window_seconds=float(_positive_int("OAUTH_LOCKOUT_WINDOW_SECONDS", OAUTH_LOCKOUT_WINDOW_SECONDS)),
+        schedule=tuple(steps),
+        global_failures=_positive_int("OAUTH_LOCKOUT_GLOBAL_FAILURES", OAUTH_LOCKOUT_GLOBAL_FAILURES),
+        global_window_seconds=float(
+            _positive_int("OAUTH_LOCKOUT_GLOBAL_WINDOW_SECONDS", OAUTH_LOCKOUT_GLOBAL_WINDOW_SECONDS)
+        ),
+        global_lock_seconds=float(_positive_int("OAUTH_LOCKOUT_GLOBAL_SECONDS", OAUTH_LOCKOUT_GLOBAL_SECONDS)),
+    )
+
+
+def _positive_int(name: str, raw: str) -> int:
+    """raw as a positive integer, or ValueError naming the setting."""
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+    return value
 
 
 def _validate_upload_settings() -> None:
