@@ -1,6 +1,7 @@
 """Bearer token authentication middleware for the vault MCP server."""
 
 import hmac
+import logging
 import re
 import uuid
 
@@ -13,6 +14,8 @@ from .config import VAULT_MCP_TOKEN
 from .context import reset_request_context, set_request_context
 from .oauth import canonical_resource, get_oauth_state, resource_matches
 from .oauth_state import TokenMetadata
+
+logger = logging.getLogger(__name__)
 
 # Paths that don't require bearer auth (OAuth flow + health)
 _AUTH_EXEMPT_PATHS = {
@@ -66,12 +69,36 @@ def _www_authenticate(request: Request, error: str) -> str:
     return f'Bearer realm="mcp", resource_metadata="{resource_metadata}", error="{error}"'
 
 
+# Headers a reverse proxy or tunnel adds to every request it relays. Cloudflare sets
+# and overwrites them at its edge, so a caller cannot strip them to look local.
+_PROXY_HEADERS = ("cf-connecting-ip", "cf-ray", "x-forwarded-for", "forwarded", "x-real-ip")
+_LOOPBACK_PEERS = {"127.0.0.1", "::1"}
+
+
+def is_direct_local_request(request: Request) -> bool:
+    """Whether the request was made on this machine rather than relayed by a proxy."""
+    peer = request.client.host if request.client else ""
+    if peer not in _LOOPBACK_PEERS:
+        return False
+    proxy_headers = {*_PROXY_HEADERS, config.OAUTH_CLIENT_IP_HEADER.lower()} - {""}
+    return not any(name in request.headers for name in proxy_headers)
+
+
 def _per_client_token(request: Request, token: str) -> TokenMetadata | None:
     """A usable per-client OAuth token issued for this MCP endpoint, otherwise None."""
     issued = get_oauth_state().lookup_access_token(token)
     if issued is None or not resource_matches(issued.resource, canonical_resource(request)):
         return None
     return issued
+
+
+def _invalid_token(request: Request) -> JSONResponse:
+    # One answer for every refused token, so it does not tell which kind failed.
+    return JSONResponse(
+        {"error": "Invalid token"},
+        status_code=401,
+        headers={"WWW-Authenticate": _www_authenticate(request, "invalid_token")},
+    )
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -110,17 +137,17 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # Constant-time compare: avoid leaking the token via response timing (#2). Bytes,
         # because hmac.compare_digest raises on str that is not ASCII.
         if hmac.compare_digest(token.encode(), VAULT_MCP_TOKEN.encode()):
+            if config.VAULT_MCP_TOKEN_LOCAL_ONLY and not is_direct_local_request(request):
+                # Logged, because a relayed request carrying the static token means it
+                # has leaked. Answered exactly like a wrong token.
+                logger.warning("Static token refused: VAULT_MCP_TOKEN_LOCAL_ONLY and the request was relayed.")
+                return _invalid_token(request)
             # The static bearer names no client: a User-Agent-derived hint stands in.
             client = request.headers.get("user-agent", "").strip()[:200] or None
         elif (issued := _per_client_token(request, token)) is not None:
             client = issued.client_id
         else:
-            # One answer for every refused token, so it does not tell which kind failed.
-            return JSONResponse(
-                {"error": "Invalid token"},
-                status_code=401,
-                headers={"WWW-Authenticate": _www_authenticate(request, "invalid_token")},
-            )
+            return _invalid_token(request)
 
         # Thread the authenticated principal (plus a request id and the client) to the tool
         # layer for the audit log. The raw token never leaves this context;

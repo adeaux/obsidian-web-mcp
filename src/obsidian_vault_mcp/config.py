@@ -82,6 +82,15 @@ OAUTH_LOCKOUT_GLOBAL_WINDOW_SECONDS = os.environ.get("OAUTH_LOCKOUT_GLOBAL_WINDO
 OAUTH_LOCKOUT_GLOBAL_SECONDS = os.environ.get("OAUTH_LOCKOUT_GLOBAL_SECONDS", "3600").strip()
 OAUTH_CLIENT_IP_HEADER = os.environ.get("OAUTH_CLIENT_IP_HEADER", "CF-Connecting-IP").strip()
 
+# Accept the static VAULT_MCP_TOKEN only on requests made on this machine (opt-in).
+# It never expires and skips the OAuth login and its lockout, so with this on, a
+# request relayed by a reverse proxy or tunnel needs a per-client OAuth token. A
+# request counts as local when it arrives from a loopback address carrying none of the
+# headers a proxy adds. Accepts 1/true/yes/on (case-insensitive).
+VAULT_MCP_TOKEN_LOCAL_ONLY = os.environ.get(
+    "VAULT_MCP_TOKEN_LOCAL_ONLY", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # Network bind address. Defaults to loopback so the server is NOT exposed on the LAN;
 # Cloudflare Tunnel reaches it over localhost. Set to 0.0.0.0 only if you deliberately
 # want direct network exposure.
